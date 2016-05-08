@@ -167,6 +167,7 @@ typedef struct {
 #define NGX_HTTP_CHECK_MYSQL                 0x0008
 #define NGX_HTTP_CHECK_AJP                   0x0010
 
+#define NGX_CHECK_HTTP_200                   0x0020
 #define NGX_CHECK_HTTP_2XX                   0x0002
 #define NGX_CHECK_HTTP_3XX                   0x0004
 #define NGX_CHECK_HTTP_4XX                   0x0008
@@ -437,6 +438,21 @@ static ngx_int_t ngx_http_upstream_check_addr_change_port(ngx_pool_t *pool,
 
 static ngx_check_conf_t *ngx_http_get_check_type_conf(ngx_str_t *str);
 
+static char *ngx_http_upstream_check_bc_healthcheck_enabled(ngx_conf_t *cf,
+    ngx_command_t *cmd, void *conf);
+static char *ngx_http_upstream_check_bc_healthcheck_delay(ngx_conf_t *cf,
+    ngx_command_t *cmd, void *conf);
+static char *ngx_http_upstream_check_bc_healthcheck_timeout(ngx_conf_t *cf,
+    ngx_command_t *cmd, void *conf);
+static char *ngx_http_upstream_check_bc_healthcheck_failcount(ngx_conf_t *cf,
+    ngx_command_t *cmd, void *conf);
+static char *ngx_http_upstream_check_bc_healthcheck_send(ngx_conf_t *cf,
+    ngx_command_t *cmd, void *conf);
+static char *ngx_http_upstream_check_bc_healthcheck_expected(ngx_conf_t *cf,
+    ngx_command_t *cmd, void *conf);
+static char *ngx_http_upstream_check_bc_healthcheck_buffer(ngx_conf_t *cf,
+    ngx_command_t *cmd, void *conf);
+
 static char *ngx_http_upstream_check(ngx_conf_t *cf,
     ngx_command_t *cmd, void *conf);
 static char *ngx_http_upstream_check_keepalive_requests(ngx_conf_t *cf,
@@ -493,6 +509,7 @@ static ngx_int_t ngx_http_upstream_check_init_process(ngx_cycle_t *cycle);
 
 
 static ngx_conf_bitmask_t  ngx_check_http_expect_alive_masks[] = {
+    { ngx_string("http_200"), NGX_CHECK_HTTP_200 },
     { ngx_string("http_2xx"), NGX_CHECK_HTTP_2XX },
     { ngx_string("http_3xx"), NGX_CHECK_HTTP_3XX },
     { ngx_string("http_4xx"), NGX_CHECK_HTTP_4XX },
@@ -502,6 +519,63 @@ static ngx_conf_bitmask_t  ngx_check_http_expect_alive_masks[] = {
 
 
 static ngx_command_t  ngx_http_upstream_check_commands[] = {
+
+    /* bc = backward compatible */
+    { ngx_string("healthcheck_enabled"),
+      NGX_HTTP_UPS_CONF|NGX_CONF_NOARGS,
+      ngx_http_upstream_check_bc_healthcheck_enabled,
+      0,
+      0,
+      NULL },
+
+    { ngx_string("healthcheck_delay"),
+      NGX_HTTP_UPS_CONF|NGX_CONF_TAKE1,
+      ngx_http_upstream_check_bc_healthcheck_delay,
+      0,
+      0,
+      NULL },
+
+    { ngx_string("healthcheck_timeout"),
+      NGX_HTTP_UPS_CONF|NGX_CONF_TAKE1,
+      ngx_http_upstream_check_bc_healthcheck_timeout,
+      0,
+      0,
+      NULL },
+
+    { ngx_string("healthcheck_failcount"),
+      NGX_HTTP_UPS_CONF|NGX_CONF_TAKE1,
+      ngx_http_upstream_check_bc_healthcheck_failcount,
+      0,
+      0,
+      NULL },
+
+    { ngx_string("healthcheck_send"),
+      NGX_HTTP_UPS_CONF|NGX_CONF_1MORE,
+      ngx_http_upstream_check_bc_healthcheck_send,
+      0,
+      0,
+      NULL },
+
+    { ngx_string("healthcheck_expected"),
+      NGX_HTTP_UPS_CONF|NGX_CONF_TAKE1,
+      ngx_http_upstream_check_bc_healthcheck_expected,
+      0,
+      0,
+      NULL },
+
+    { ngx_string("healthcheck_buffer"),
+      NGX_HTTP_UPS_CONF|NGX_CONF_TAKE1,
+      ngx_http_upstream_check_bc_healthcheck_buffer,
+      0,
+      0,
+      NULL },
+
+    { ngx_string("healthcheck_status"),
+      NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1|NGX_CONF_NOARGS,
+      ngx_http_upstream_check_status,
+      0,
+      0,
+      NULL },
 
     { ngx_string("check"),
       NGX_HTTP_UPS_CONF|NGX_CONF_1MORE,
@@ -661,6 +735,18 @@ static ngx_check_conf_t  ngx_check_types[] = {
       1 },
 
     { NGX_HTTP_CHECK_HTTP,
+      ngx_string("qws_http"),
+      ngx_string("GET / HTTP/1.0\r\n\r\n"),
+      NGX_CONF_BITMASK_SET | NGX_CHECK_HTTP_200,
+      ngx_http_upstream_check_send_handler,
+      ngx_http_upstream_check_recv_handler,
+      ngx_http_upstream_check_http_init,
+      ngx_http_upstream_check_http_parse,
+      ngx_http_upstream_check_http_reinit,
+      1,
+      1 },
+
+    { NGX_HTTP_CHECK_HTTP,
       ngx_string("http"),
       ngx_string("GET / HTTP/1.0\r\n\r\n"),
       NGX_CONF_BITMASK_SET | NGX_CHECK_HTTP_2XX | NGX_CHECK_HTTP_3XX,
@@ -783,8 +869,9 @@ ngx_http_upstream_check_add_peer(ngx_conf_t *cf,
 
     ucscf = ngx_http_conf_upstream_srv_conf(us, ngx_http_upstream_check_module);
 
+    /* Here we just ignore the healthcheck */
     if(ucscf->check_interval == 0) {
-        return NGX_ERROR;
+        return NGX_DONE;
     }
 
     ucmcf = ngx_http_conf_get_module_main_conf(cf,
@@ -990,6 +1077,10 @@ ngx_http_upstream_check_add_timers(ngx_cycle_t *cycle)
 
         ucscf = peer[i].conf;
         cf = ucscf->check_type_conf;
+
+        if (cf == NULL) {
+            continue;
+        }
 
         if (cf->need_pool) {
             peer[i].pool = ngx_create_pool(ngx_pagesize, cycle->log);
@@ -1465,7 +1556,9 @@ ngx_http_upstream_check_recv_handler(ngx_event_t *event)
         return;
 
     case NGX_ERROR:
-        ngx_log_error(NGX_LOG_ERR, event->log, 0,
+        /* Here we do not need to print error on prod envrionment,
+         * so we just use NGX_LOG_INFO */
+        ngx_log_error(NGX_LOG_INFO, event->log, 0,
                       "check protocol %V error with peer: %V ",
                       &peer->conf->check_type_conf->name,
                       &peer->check_peer_addr->name);
@@ -1542,8 +1635,9 @@ ngx_http_upstream_check_http_parse(ngx_http_upstream_check_peer_t *peer)
         }
 
         code = ctx->status.code;
-
-        if (code >= 200 && code < 300) {
+        if (code == 200) {
+            code_n = NGX_CHECK_HTTP_200;
+        } else if (code >= 200 && code < 300) {
             code_n = NGX_CHECK_HTTP_2XX;
         } else if (code >= 300 && code < 400) {
             code_n = NGX_CHECK_HTTP_3XX;
@@ -2518,7 +2612,7 @@ ngx_http_upstream_check_status_update(ngx_http_upstream_check_peer_t *peer,
         peer->shm->fall_count = 0;
         if (peer->shm->down && peer->shm->rise_count >= ucscf->rise_count) {
             peer->shm->down = 0;
-            ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0,
+            ngx_log_error(NGX_LOG_INFO, ngx_cycle->log, 0,
                           "enable check peer: %V ",
                           &peer->check_peer_addr->name);
         }
@@ -2590,7 +2684,9 @@ ngx_http_upstream_check_timeout_handler(ngx_event_t *event)
     peer = event->data;
     peer->pc.connection->error = 1;
 
-    ngx_log_error(NGX_LOG_ERR, event->log, 0,
+    /* Here we do not need to print error on prod envrionment,
+     * so we just use NGX_LOG_INFO */
+    ngx_log_error(NGX_LOG_INFO, event->log, 0,
                   "check time out with peer: %V ",
                   &peer->check_peer_addr->name);
 
@@ -2832,6 +2928,8 @@ ngx_http_upstream_check_status_html_format(ngx_buf_t *b,
 {
     ngx_uint_t                      i, count;
     ngx_http_upstream_check_peer_t *peer;
+    ngx_str_t incomplete_check_type = ngx_string("-");
+    ngx_str_t *actural_check_type   = &incomplete_check_type;
 
     peer = peers->peers.elts;
 
@@ -2894,6 +2992,12 @@ ngx_http_upstream_check_status_html_format(ngx_buf_t *b,
             }
         }
 
+        if (peer[i].conf->check_type_conf != NULL) {
+            actural_check_type = &peer[i].conf->check_type_conf->name;
+        } else {
+            actural_check_type = &incomplete_check_type;
+        }
+
         b->last = ngx_snprintf(b->last, b->end - b->last,
                 "  <tr%s>\n"
                 "    <td>%ui</td>\n"
@@ -2913,6 +3017,7 @@ ngx_http_upstream_check_status_html_format(ngx_buf_t *b,
                 peer[i].shm->rise_count,
                 peer[i].shm->fall_count,
                 &peer[i].conf->check_type_conf->name,
+                actural_check_type,
                 peer[i].conf->port);
     }
 
@@ -2929,6 +3034,8 @@ ngx_http_upstream_check_status_csv_format(ngx_buf_t *b,
 {
     ngx_uint_t                       i;
     ngx_http_upstream_check_peer_t  *peer;
+    ngx_str_t incomplete_check_type = ngx_string("-");
+    ngx_str_t *actural_check_type   = &incomplete_check_type;
 
     peer = peers->peers.elts;
     for (i = 0; i < peers->peers.nelts; i++) {
@@ -2946,6 +3053,12 @@ ngx_http_upstream_check_status_csv_format(ngx_buf_t *b,
             }
         }
 
+        if (peer[i].conf->check_type_conf != NULL) {
+            actural_check_type = &peer[i].conf->check_type_conf->name;
+        } else {
+            actural_check_type = &incomplete_check_type;
+        }
+
         b->last = ngx_snprintf(b->last, b->end - b->last,
                 "%ui,%V,%V,%s,%ui,%ui,%V,%ui\n",
                 i,
@@ -2955,6 +3068,7 @@ ngx_http_upstream_check_status_csv_format(ngx_buf_t *b,
                 peer[i].shm->rise_count,
                 peer[i].shm->fall_count,
                 &peer[i].conf->check_type_conf->name,
+                actural_check_type,
                 peer[i].conf->port);
     }
 }
@@ -2966,6 +3080,8 @@ ngx_http_upstream_check_status_json_format(ngx_buf_t *b,
 {
     ngx_uint_t                       count, i, last;
     ngx_http_upstream_check_peer_t  *peer;
+    ngx_str_t incomplete_check_type = ngx_string("-");
+    ngx_str_t *actural_check_type   = &incomplete_check_type;
 
     peer = peers->peers.elts;
 
@@ -3013,6 +3129,12 @@ ngx_http_upstream_check_status_json_format(ngx_buf_t *b,
             }
         }
 
+        if (peer[i].conf->check_type_conf != NULL) {
+            actural_check_type = &peer[i].conf->check_type_conf->name;
+        } else {
+            actural_check_type = &incomplete_check_type;
+        }
+
         b->last = ngx_snprintf(b->last, b->end - b->last,
                 "    {\"index\": %ui, "
                 "\"upstream\": \"%V\", "
@@ -3029,7 +3151,7 @@ ngx_http_upstream_check_status_json_format(ngx_buf_t *b,
                 peer[i].shm->down ? "down" : "up",
                 peer[i].shm->rise_count,
                 peer[i].shm->fall_count,
-                &peer[i].conf->check_type_conf->name,
+                actural_check_type,
                 peer[i].conf->port,
                 (i == last) ? "" : ",");
     }
@@ -3067,6 +3189,188 @@ ngx_http_get_check_type_conf(ngx_str_t *str)
     return NULL;
 }
 
+static char *
+ngx_http_upstream_check_bc_healthcheck_enabled(ngx_conf_t *cf,
+    ngx_command_t *cmd, void *conf)
+{
+    ngx_str_t                            s;
+    ngx_uint_t                           port, rise, fall, default_down;
+    ngx_msec_t                           interval, timeout;
+    ngx_http_upstream_check_srv_conf_t  *ucscf;
+
+    port = 0;
+    rise = 2;
+    fall = 2;
+    interval = 10000;
+    timeout = 2000;
+    default_down = 1;
+
+    ucscf = ngx_http_conf_get_module_srv_conf(cf,
+                                              ngx_http_upstream_check_module);
+    if (ucscf == NULL) {
+        return NGX_CONF_ERROR;
+    }
+
+    ucscf->port = port;
+    ucscf->check_interval = interval;
+    ucscf->check_timeout = timeout;
+    ucscf->fall_count = fall;
+    ucscf->rise_count = rise;
+    ucscf->default_down = default_down;
+
+    ngx_str_set(&s, "qws_http");
+    ucscf->check_type_conf = ngx_http_get_check_type_conf(&s);
+
+    return NGX_CONF_OK;
+}
+
+static char *
+ngx_http_upstream_check_bc_healthcheck_delay(ngx_conf_t *cf,
+    ngx_command_t *cmd, void *conf)
+{
+    ngx_str_t                           *value, s;
+    ngx_msec_t                           interval;
+    ngx_http_upstream_check_srv_conf_t  *ucscf;
+
+    ucscf = ngx_http_conf_get_module_srv_conf(cf,
+                                              ngx_http_upstream_check_module);
+    if (ucscf == NULL) {
+        return NGX_CONF_ERROR;
+    }
+
+    value = cf->args->elts;
+
+    s.len = value[1].len;
+    s.data = value[1].data;
+
+    interval = ngx_atoi(s.data, s.len);
+    if (interval == (ngx_msec_t) NGX_ERROR || interval == 0) {
+        return "Invalid healthcheck delay";
+    }
+
+    ucscf->check_interval = interval;
+    return NGX_CONF_OK;
+}
+
+static char *
+ngx_http_upstream_check_bc_healthcheck_timeout(ngx_conf_t *cf,
+    ngx_command_t *cmd, void *conf)
+{
+    ngx_str_t                           *value, s;
+    ngx_msec_t                           timeout;
+    ngx_http_upstream_check_srv_conf_t  *ucscf;
+
+    ucscf = ngx_http_conf_get_module_srv_conf(cf,
+                                              ngx_http_upstream_check_module);
+    if (ucscf == NULL) {
+        return NGX_CONF_ERROR;
+    }
+
+    value = cf->args->elts;
+
+    s.len = value[1].len;
+    s.data = value[1].data;
+
+    timeout = ngx_atoi(s.data, s.len);
+    if (timeout == (ngx_msec_t) NGX_ERROR || timeout == 0) {
+        return "Invalid healthcheck timeout";
+    }
+
+    ucscf->check_timeout = timeout;
+    return NGX_CONF_OK;
+}
+
+static char *
+ngx_http_upstream_check_bc_healthcheck_failcount(ngx_conf_t *cf,
+    ngx_command_t *cmd, void *conf)
+{
+    ngx_str_t                           *value, s;
+    ngx_uint_t                           fall;
+    ngx_http_upstream_check_srv_conf_t  *ucscf;
+
+    ucscf = ngx_http_conf_get_module_srv_conf(cf,
+                                              ngx_http_upstream_check_module);
+    if (ucscf == NULL) {
+        return NGX_CONF_ERROR;
+    }
+
+    value = cf->args->elts;
+
+    s.len = value[1].len;
+    s.data = value[1].data;
+
+    fall = ngx_atoi(s.data, s.len);
+    if (fall == (ngx_uint_t) NGX_ERROR || fall == 0) {
+        return "Invalid healthcheck failcount";
+    }
+
+    ucscf->fall_count = fall;
+    return NGX_CONF_OK;
+}
+
+static char *
+ngx_http_upstream_check_bc_healthcheck_expected(ngx_conf_t *cf,
+    ngx_command_t *cmd, void *conf)
+{
+    return "healthcheck_expected is not supported any more";
+}
+
+static char *
+ngx_http_upstream_check_bc_healthcheck_buffer(ngx_conf_t *cf,
+    ngx_command_t *cmd, void *conf)
+{
+    return "healthcheck_buffer is not supported any more";
+}
+
+static char *
+ngx_http_upstream_check_bc_healthcheck_send(ngx_conf_t *cf, ngx_command_t *cmd,
+        void *conf) {
+    ngx_str_t                           *value;
+    ngx_int_t                            num;
+    int                                  i;
+    size_t                               at;
+    ngx_http_upstream_check_srv_conf_t  *ucscf;
+
+    value = cf->args->elts;
+
+    ucscf = ngx_http_conf_get_module_srv_conf(cf,
+                                              ngx_http_upstream_check_module);
+
+    value = cf->args->elts;
+    num = cf->args->nelts;
+
+    ucscf->send.len = 0;
+
+    for (i = 1; i < num; i++) {
+        if (i != 1) {
+            ucscf->send.len += sizeof(CRLF) - 1; /* \r\n */
+        }
+        ucscf->send.len += value[i].len;
+    }
+    ucscf->send.len += (sizeof(CRLF) - 1) * 2;
+    ucscf->send.data = ngx_pnalloc(cf->pool, ucscf->send.len + 1);
+    if (ucscf->send.data == NULL) {
+        return "Unable to alloc data to send";
+    }
+    at = 0;
+    for (i = 1; i < num; i++) {
+        if (i != 1) {
+            ngx_memcpy(ucscf->send.data + at, CRLF, sizeof(CRLF) - 1);
+            at += sizeof(CRLF) - 1;
+        }
+        ngx_memcpy(ucscf->send.data + at, value[i].data, value[i].len);
+        at += value[i].len;
+    }
+
+    ngx_memcpy(ucscf->send.data + at, CRLF CRLF, (sizeof(CRLF) - 1) * 2);
+    at += (sizeof(CRLF) - 1) * 2;
+    ucscf->send.data[at] = 0;
+    if (at != ucscf->send.len) {
+        return "healthcheck: Logic error.  Length doesn't match";
+    }
+
+    return NGX_CONF_OK;
+}
 
 static char *
 ngx_http_upstream_check(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
